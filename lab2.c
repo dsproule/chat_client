@@ -35,7 +35,14 @@
  */
 
 /* ****************************************************** */
-#include "util.h"
+#define MAX_COL 64
+#define MAX_ROW 22
+
+void clear_section(int row_start, int row_end, int col_start, int col_end);
+char process_char(char keycode, int shift);
+int in_array(char *array, char target);
+void put_in_arr(char arr[6], char target);
+void rem_from_arr(char arr[6], char target);
 
 #define CLEAR_SCREEN() clear_section(0, MAX_ROW + 1, 0, MAX_COL + 1);
 #define CLEAR_OUTPUT() clear_section(0, MAX_ROW - 2, 0, MAX_COL + 1);
@@ -116,13 +123,14 @@ int main()
 	  fbputs("*", MAX_ROW - 2, col);
 
   // move these to top when everything works
-  char msg_buff[MAX_BUFF], cur_c;
+  char msg_buff[MAX_BUFF], mirror[6], cur_c, ncc;
   int cursor, msg_len, orig_curs, i;
-  unsigned int pressed;
 
   cur_c = '_';
-  msg_len = cursor = output_line = 0;
-  pressed = 0;
+  msg_len = cursor = output_line = ncc = 0;
+  
+  for (i = 0; i < 6; i++)
+	mirror[i] = '\0';
 
   /* Look for and handle keypresses */
   CLEAR_OUTPUT();
@@ -133,35 +141,29 @@ int main()
   for (;;) {
 	cur_c = (cur_c == '_') ? msg_buff[cursor] : '_';
 	fbputchar(cur_c, (MAX_ROW - 1 + (cursor >= MAX_COL)), cursor % MAX_COL);
-    	  
+
 	libusb_interrupt_transfer(keyboard, endpoint_address,
 			      (unsigned char *) &packet, sizeof(packet),
-			      &transferred, 500);
+			      &transferred, 250);
 
-	/* Finds the letter flags with (doesn't work for capitals yet)*/
-	for (i = 0; i < 26; i++)
-		if ((pressed >> i) & 0b1) {
-			DRAW_CHAR((char)(97 + i));
-			msg_buff[cursor++] = (char)(97 + i);
-			msg_len++;
-		}
+	/* Value is in ms, updates at that frequency */
 
 	if (transferred == sizeof(packet)) {
-		pressed = 0;
-		for (i = 0; i < 5; i++) {
+		// Debugging, prints packet
+		for (i = 0; i < 6; i++)
+			printf("%x ", packet.keycode[i]);
+		printf("\n");
+
+		for (i = 0; i < 6; i++) {
 			if (packet.keycode[i] == 0)
 				continue;
 
 			sprintf(keystate, "%c", packet.keycode[i] + 93);
-			if (keystate[0] == 137)
-				keystate[0] = ' ';
-			printf("%d\n", packet.keycode[i]);
-		
-			if (packet.modifiers && (USB_LSHIFT | USB_RSHIFT))
-				keystate[0] -= 32;
 
 			if (packet.keycode[i] == 0x29) {						// ESC
 				CLEAR_INPUT();
+				CLEAR_OUTPUT();
+				fbputs("User has exited...", 0, 0);
 				exit(0);
 			} else if (packet.keycode[i] == 0x4f && cursor < msg_len) {			// RIGHT
 				DRAW_CHAR(msg_buff[cursor]);
@@ -169,39 +171,57 @@ int main()
 			} else if (packet.keycode[i] == 0x50 && cursor > 0) {				// LEFT
 				DRAW_CHAR(msg_buff[cursor]);
 				cursor--;
-			// may be redundant if-conditions
 			} else if (packet.keycode[i] == 0x2a && cursor > 0 && msg_len > 0) {		// BACKSPACE
+				printf("%d\n", msg_len);
 				msg_buff[msg_len+1] = ' ';
 				orig_curs = cursor;
 				msg_len--;
 				if (cursor < msg_len) {
-					for (; msg_buff[cursor] != ' '; cursor++) {
+					for (; cursor < msg_len; cursor++) {
 						msg_buff[cursor] = msg_buff[cursor + 1];
 						DRAW_CHAR(msg_buff[cursor]);
 					}
+
+					for (cursor = msg_len; cursor < MAX_BUFF; cursor++)
+						DRAW_CHAR(' ');
+				
 					cursor = orig_curs;
 				} else {
+					fbputchar(' ', (MAX_ROW - 1 + (cursor >= MAX_COL)), cursor % MAX_COL);
+					msg_buff[cursor--] = ' ';
+					fbputchar(' ', (MAX_ROW - 1 + (cursor >= MAX_COL)), cursor % MAX_COL);
 					msg_buff[cursor] = ' ';
-					cursor--;
 					fbputchar(' ', (MAX_ROW - 1 + (cursor >= MAX_COL)), cursor % MAX_COL);
 				}
 			} else if (packet.keycode[i] == 0x28) {						// ENTER
 				msg_buff[msg_len] = '\0';
-				printf("MESSAGE: %s\n", msg_buff);
-				// dont forget to look for errors
-				write(sockfd, msg_buff, msg_len);
+				if (write(sockfd, msg_buff, msg_len) < 0) {
+					printf("I want to cry\n");
+					exit(1);
+				}
 			
 				CLEAR_INPUT();
 				for (cursor = 0; cursor < MAX_BUFF; cursor++)
 					msg_buff[cursor] = ' ';
 				cursor = 0;
 				msg_len = 0;
-			} else if (cursor != MAX_BUFF) {
-				if (packet.keycode[i] != 0x4f)
-					pressed |= (0b1 << (keystate[0] - 97));
+			} else if (cursor != MAX_BUFF && packet.keycode[i] != 0x2a) {
+				/* on packet recv */
+				if (packet.keycode[i] != 0x4f && msg_len < MAX_BUFF - 1) {
+					keystate[0] = process_char(keystate[0], packet.modifiers && (USB_LSHIFT | USB_RSHIFT));
+					if (!in_array(mirror, packet.keycode[i])) {
+						put_in_arr(mirror, packet.keycode[i]);
+						DRAW_CHAR(keystate[0]);
+						msg_buff[cursor++] = keystate[0];
+						msg_len++;
+					}
+				}
 			}
 		}
-	
+
+		for (int j = 0; j < 6; j++)
+			if (!in_array((char *)packet.keycode, mirror[j]))
+				rem_from_arr(mirror, mirror[j]);
 	}
   }
 
@@ -222,11 +242,13 @@ void *network_thread_f(void *ignored)
   while ( (n = read(sockfd, &recvBuf, BUFFER_SIZE - 1)) > 0 ) {
     recvBuf[n] = '\0';
     printf("%s", recvBuf);
-    if (output_line == MAX_ROW - 2) {
+    if (output_line >= MAX_ROW - 4) {
 	output_line = 0;
+  	for (int col = 0; col < MAX_COL + 1; col++)
+	  	fbputs("*", MAX_ROW - 2, col);
 	CLEAR_OUTPUT();
     }	
-    for (i = 0; recvBuf[i] != '\0'; i++) {
+    for (int i = 0; recvBuf[i] != '\0'; i++) {
 	if (recvBuf[i] != '\n')
 		fbputchar(recvBuf[i], output_line, i % MAX_COL);
 	if (i == MAX_COL - 1)
@@ -246,4 +268,154 @@ void clear_section(int row_start, int row_end, int col_start, int col_end)
 	for (row = row_start; row < row_end; row++)
 		for (col = col_start; col < col_end; col++)
 			fbputs(" ", row, col);
+}
+
+char process_char(char keycode, int shift)
+{
+	int letter = (keycode >= 97 && keycode <= 122);
+
+	/* Numbers */
+	if (keycode >= 123 && keycode <= 132) {
+		if (keycode == 132)
+			keycode = 48 + 74;
+		keycode -= 74;
+	}
+
+	/* Alternate keys */
+	if (!letter)
+		switch(keycode) {
+			case 137:
+				keycode = ' ';
+				break;
+			case 138:
+				keycode = '-';
+				break;
+			case 139:
+				keycode = '=';
+				break;
+			case 140:
+				keycode = '[';
+				break;
+			case 141:
+				keycode = ']';
+				break;
+			case 142:
+				keycode = '\\';
+				break;
+			case 144:
+				keycode = ';';
+				break;
+			case 145:
+				keycode = '\'';
+				break;
+			case 146:
+				keycode = '`';
+				break;
+			case 147:
+				keycode = ',';
+				break;
+			case 148:
+				keycode = '.';
+				break;
+			case 149:
+				keycode = '/';
+				break;
+		}
+		
+	/* Upper case */
+	if (shift && letter)
+		keycode -= 32;
+	else if (shift)
+		switch (keycode) {
+			case '0':
+				keycode = ')';
+				break;
+			case '1':
+				keycode = '!';
+				break;
+			case '2':
+				keycode = '@';
+				break;
+			case '3':
+				keycode = '#';
+				break;
+			case '4':
+				keycode = '$';
+				break;
+			case '5':
+				keycode = '%';
+				break;
+			case '6':
+				keycode = '^';
+				break;
+			case '7':
+				keycode = '&';
+				break;
+			case '8':
+				keycode = '*';
+				break;
+			case '9':
+				keycode = '(';
+				break;
+			case '-':
+				keycode = '_';
+				break;
+			case '=':
+				keycode = '+';
+				break;
+			case '[':
+				keycode = '{';
+				break;
+			case ']':
+				keycode = '}';
+				break;
+			case '`':
+				keycode = '~';
+				break;
+			case '\\':
+				keycode = '|';
+				break;
+			case ';':
+				keycode = ':';
+				break;
+			case '\'':
+				keycode = '\"';
+				break;
+			case ',':
+				keycode = '<';
+				break;
+			case '.':
+				keycode = '>';
+				break;
+			case '/':
+				keycode = '?';
+				break;
+			}
+
+	return keycode;
+}
+
+int in_array(char *array, char target) {
+	for (int i = 0; i < 6; i++)
+		if (array[i] == target)
+			return 1;
+	return 0;
+}
+
+// should change in case array is full
+void put_in_arr(char arr[6], char target)
+{
+	for (int i = 0; i < 6; i++)
+		if (arr[i] == '\0') {
+			arr[i] = target;
+			break;
+		}
+}
+
+void rem_from_arr(char arr[6], char target)
+{
+	for (int i = 0; i < 6; i++)
+		if (arr[i] == target) {
+			arr[i] = '\0';
+		}
 }
